@@ -17,11 +17,19 @@ const RECIPE_DISPLAY_SHAPELESS: i32 = 0;
 const RECIPE_DISPLAY_SHAPED: i32 = 1;
 const RECIPE_DISPLAY_FURNACE: i32 = 2;
 
-// Slot Display type IDs
+// Slot Display type IDs (stable across all versions)
 const SLOT_DISPLAY_EMPTY: i32 = 0;
 const SLOT_DISPLAY_ANY_FUEL: i32 = 1;
-const SLOT_DISPLAY_ITEM: i32 = 4;
-const SLOT_DISPLAY_COMPOSITE: i32 = 10;
+
+// In 26.1, two new slot display types were inserted at IDs 2 and 3
+// (with_any_potion, only_with_component), shifting item from 2 -> 4 and composite from 7 -> 10.
+// Additionally, a third new type (dyed) was inserted at ID 7, shifting composite 7 -> 10.
+fn slot_display_item(version: MinecraftVersion) -> i32 {
+    if version >= MinecraftVersion::V_26_1 { 4 } else { 2 }
+}
+fn slot_display_composite(version: MinecraftVersion) -> i32 {
+    if version >= MinecraftVersion::V_26_1 { 10 } else { 7 }
+}
 
 // RecipeBookCategory IDs
 const CATEGORY_CRAFTING_BUILDING: i32 = 0;
@@ -59,7 +67,7 @@ fn write_item_slot_display(
     item: &Item,
     version: MinecraftVersion,
 ) -> Result<(), WritingError> {
-    write.write_var_int(&VarInt(SLOT_DISPLAY_ITEM))?;
+    write.write_var_int(&VarInt(slot_display_item(version)))?;
     write.write_var_int(&VarInt(item_id_versioned(item, version)))?;
     Ok(())
 }
@@ -107,7 +115,7 @@ fn write_ingredient_slot_display(
             } else if items.len() == 1 {
                 write_item_slot_display(write, items[0], version)?;
             } else {
-                write.write_var_int(&VarInt(SLOT_DISPLAY_COMPOSITE))?;
+                write.write_var_int(&VarInt(slot_display_composite(version)))?;
                 write.write_var_int(&VarInt(items.len() as i32))?;
                 for item in &items {
                     write_item_slot_display(write, item, version)?;

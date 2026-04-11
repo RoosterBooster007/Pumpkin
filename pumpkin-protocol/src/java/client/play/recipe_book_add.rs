@@ -25,10 +25,18 @@ const SLOT_DISPLAY_ANY_FUEL: i32 = 1;
 // (with_any_potion, only_with_component), shifting item from 2 -> 4 and composite from 7 -> 10.
 // Additionally, a third new type (dyed) was inserted at ID 7, shifting composite 7 -> 10.
 fn slot_display_item(version: MinecraftVersion) -> i32 {
-    if version >= MinecraftVersion::V_26_1 { 4 } else { 2 }
+    if version >= MinecraftVersion::V_26_1 {
+        4
+    } else {
+        2
+    }
 }
 fn slot_display_composite(version: MinecraftVersion) -> i32 {
-    if version >= MinecraftVersion::V_26_1 { 10 } else { 7 }
+    if version >= MinecraftVersion::V_26_1 {
+        10
+    } else {
+        7
+    }
 }
 
 // RecipeBookCategory IDs

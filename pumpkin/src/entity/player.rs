@@ -254,12 +254,17 @@ impl ChunkManager {
             let new_level = ChunkLoading::get_level_from_view_distance(view_distance);
             lock.add_ticket(center, new_level);
 
-            if old_center != center || old_view_distance != view_distance {
+            let sim_dist = self.world.server.upgrade().map_or(10, |s| {
+                s.advanced_config.networking.java.simulation_distance.get()
+            });
+            let sim_level = ChunkLoading::get_level_from_simulation_distance(sim_dist);
+            lock.add_ticket(center, sim_level);
+
+            if (old_center != center || old_view_distance != view_distance) && old_view_distance > 0
+            {
                 let old_level = ChunkLoading::get_level_from_view_distance(old_view_distance);
-                // Don't remove if it would be the same ticket
-                if old_center != center || old_level != new_level {
-                    lock.remove_ticket(old_center, old_level);
-                }
+                lock.remove_ticket(old_center, old_level);
+                lock.remove_ticket(old_center, sim_level);
             }
             lock.send_change();
         };
@@ -906,7 +911,7 @@ impl Player {
         let level = &world.level;
 
         // Decrement the value of watched chunks
-        let chunks_to_clean = level.mark_chunks_as_not_watched(&radial_chunks).await;
+        let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
         // Remove chunks with no watchers from the cache
         if !chunks_to_clean.is_empty() {
             world.remove_entities_in_chunks(&chunks_to_clean).await;
@@ -1972,15 +1977,27 @@ impl Player {
         // }
 
         // Statistics updates
-        {
+        let sneak_time = {
             let mut stats = self.stats.lock().await;
             stats.increment_custom(statistics::CustomStatistic::PlayTime, 1);
             stats.increment_custom(statistics::CustomStatistic::TotalWorldTime, 1);
             stats.increment_custom(statistics::CustomStatistic::TimeSinceDeath, 1);
             stats.increment_custom(statistics::CustomStatistic::TimeSinceRest, 1);
-            if self.living_entity.entity.sneaking.load(Ordering::Relaxed) {
-                stats.increment_custom(statistics::CustomStatistic::SneakTime, 1);
-            }
+            self.living_entity
+                .entity
+                .sneaking
+                .load(Ordering::Relaxed)
+                .then(|| {
+                    stats.increment_custom(statistics::CustomStatistic::SneakTime, 1);
+                    stats.get(
+                        statistics::StatisticCategory::Custom,
+                        statistics::CustomStatistic::SneakTime as i32,
+                    )
+                })
+        };
+        if let Some(sneak_time) = sneak_time {
+            self.update_score_for_criteria("minecraft.custom:minecraft.sneak_time", sneak_time)
+                .await;
         }
 
         {
@@ -2342,11 +2359,31 @@ impl Player {
         stat: i32,
         amount: i32,
     ) {
-        self.stats.lock().await.increment(category, stat, amount);
+        let value = {
+            let mut stats = self.stats.lock().await;
+            stats.increment(category, stat, amount);
+            stats.get(category, stat)
+        };
+        if let Some(criterion) = crate::world::scoreboard::statistic_criterion(category, stat) {
+            self.update_score_for_criteria(&criterion, value).await;
+        }
+        if category == statistics::StatisticCategory::Custom
+            && stat == statistics::CustomStatistic::Deaths as i32
+        {
+            self.update_score_for_criteria("deathCount", value).await;
+        }
     }
 
     pub async fn set_stat(&self, category: statistics::StatisticCategory, stat: i32, value: i32) {
         self.stats.lock().await.set(category, stat, value);
+        if let Some(criterion) = crate::world::scoreboard::statistic_criterion(category, stat) {
+            self.update_score_for_criteria(&criterion, value).await;
+        }
+        if category == statistics::StatisticCategory::Custom
+            && stat == statistics::CustomStatistic::Deaths as i32
+        {
+            self.update_score_for_criteria("deathCount", value).await;
+        }
     }
 
     pub async fn get_movement_statistic(&self) -> statistics::CustomStatistic {
@@ -2355,15 +2392,8 @@ impl Player {
             let vehicle = entity.vehicle.lock().await;
             if let Some(vehicle) = vehicle.as_ref() {
                 let entity_type = vehicle.get_entity().entity_type;
-                if entity_type == &EntityType::OAK_BOAT
-                    || entity_type == &EntityType::SPRUCE_BOAT
-                    || entity_type == &EntityType::BIRCH_BOAT
-                    || entity_type == &EntityType::JUNGLE_BOAT
-                    || entity_type == &EntityType::ACACIA_BOAT
-                    || entity_type == &EntityType::DARK_OAK_BOAT
-                    || entity_type == &EntityType::MANGROVE_BOAT
-                    || entity_type == &EntityType::CHERRY_BOAT
-                    || entity_type == &EntityType::BAMBOO_RAFT
+                if entity_type.resource_name.ends_with("_boat")
+                    || entity_type.resource_name.ends_with("_raft")
                 {
                     return statistics::CustomStatistic::BoatOneCm;
                 }
@@ -2491,9 +2521,12 @@ impl Player {
     pub async fn unload_watched_chunks(&self, world: &World) {
         let radial_chunks = self.watched_section.load().all_chunks_within();
         let level = &world.level;
-        let chunks_to_clean = level.mark_chunks_as_not_watched(&radial_chunks).await;
-        // level.clean_chunks(&chunks_to_clean).await;
-        for chunk in chunks_to_clean {
+        let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
+        if !chunks_to_clean.is_empty() {
+            world.remove_entities_in_chunks(&chunks_to_clean).await;
+            level.clean_entity_chunks(&chunks_to_clean);
+        }
+        for chunk in &chunks_to_clean {
             self.client
                 .enqueue_packet(&CUnloadChunk::new(chunk.x, chunk.y))
                 .await;
@@ -3079,16 +3112,28 @@ impl Player {
         let config = self.config.load();
         self.living_entity.entity.send_meta_data(
             &[
+                // v26.x
                 Metadata::new(
                     TrackedData::PLAYER_MODE_CUSTOMISATION,
                     MetaDataType::BYTE,
                     config.skin_parts,
                 ),
-                // Metadata::new(
-                //     TrackedData::DATA_MAIN_ARM_ID,
-                //     MetaDataType::ARM,
-                //     VarInt(config.main_hand as u8 as i32),
-                // ),
+                Metadata::new(
+                    TrackedData::PLAYER_MAIN_HAND,
+                    MetaDataType::HUMANOID_ARM,
+                    config.main_hand as u8,
+                ),
+                // v1.21.x
+                Metadata::new(
+                    TrackedData::PLAYER_MODE_CUSTOMIZATION_ID,
+                    MetaDataType::BYTE,
+                    config.skin_parts,
+                ),
+                Metadata::new(
+                    TrackedData::MAIN_ARM_ID,
+                    MetaDataType::BYTE,
+                    config.main_hand as u8,
+                ),
             ],
             None,
         );

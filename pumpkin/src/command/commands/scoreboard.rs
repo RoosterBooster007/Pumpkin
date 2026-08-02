@@ -2,9 +2,11 @@ use crate::command::argument_builder::{ArgumentBuilder, argument, command, liter
 use crate::command::argument_types::core::integer::IntegerArgumentType;
 use crate::command::argument_types::core::string::StringArgumentType;
 use crate::command::argument_types::display_slot::ScoreboardDisplaySlotArgumentType;
-use crate::command::argument_types::entity::EntityArgumentType;
 use crate::command::argument_types::objective::ObjectiveArgumentType;
+use crate::command::argument_types::objective_criteria::ObjectiveCriteriaArgumentType;
+use crate::command::argument_types::score_holder::ScoreHolderArgumentType;
 use crate::command::context::command_context::CommandContext;
+use crate::command::errors::command_syntax_error::CommandSyntaxError;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
@@ -71,6 +73,11 @@ const NO_VALUE_ERROR: CommandErrorType<2> = CommandErrorType::new(
 const OBJECTIVE_NOT_FOUND_ERROR: CommandErrorType<0> = CommandErrorType::new(
     translation::java::ARGUMENTS_OBJECTIVE_NOTFOUND,
     translation::java::ARGUMENTS_OBJECTIVE_NOTFOUND,
+);
+
+const DIVIDE_BY_ZERO_ERROR: CommandErrorType<0> = CommandErrorType::new(
+    translation::java::ARGUMENTS_OPERATION_DIV0,
+    translation::java::ARGUMENTS_OPERATION_DIV0,
 );
 
 struct ObjectivesAddExecutor {
@@ -140,7 +147,7 @@ struct PlayersEnableExecutor;
 impl CommandExecutor for PlayersEnableExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = ObjectiveArgumentType::get(context, ARG_OBJECTIVE)?;
 
             let world = context.world();
@@ -158,8 +165,7 @@ impl CommandExecutor for PlayersEnableExecutor {
             let objective_display_name = objective.display_name.clone();
 
             let mut enabled_count = 0;
-            for player in &targets {
-                let player_name = &player.gameprofile.name;
+            for player_name in &targets {
                 let current_score = scoreboard
                     .get_scores()
                     .get(objective_name)
@@ -196,7 +202,7 @@ impl CommandExecutor for PlayersEnableExecutor {
                     translation::java::COMMANDS_SCOREBOARD_PLAYERS_ENABLE_SUCCESS_SINGLE,
                     [
                         objective_display_name,
-                        TextComponent::text(targets[0].gameprofile.name.clone()),
+                        TextComponent::text(targets[0].clone()),
                     ],
                 )
             } else {
@@ -494,7 +500,7 @@ struct PlayersSetExecutor;
 impl CommandExecutor for PlayersSetExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let value = IntegerArgumentType::get(context, ARG_SCORE)?;
 
@@ -505,15 +511,11 @@ impl CommandExecutor for PlayersSetExecutor {
                 return Err(OBJECTIVE_NOT_FOUND_ERROR.create_without_context());
             }
 
-            for player in &targets {
-                let score = ScoreboardScore {
-                    entity_name: Arc::from(player.gameprofile.name.as_str()),
-                    objective_name: Arc::from(objective_name),
-                    value: VarInt(value),
-                    display_name: None,
-                    number_format: None,
-                    locked: false,
-                };
+            for player_name in &targets {
+                let existing = scoreboard
+                    .get_player_score_info(player_name, objective_name)
+                    .cloned();
+                let score = score_with_value(existing.as_ref(), player_name, objective_name, value);
                 scoreboard.update_score(world, score).await;
             }
 
@@ -526,7 +528,7 @@ impl CommandExecutor for PlayersSetExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_SET_SUCCESS_SINGLE,
                             [
                                 TextComponent::text(objective_name.to_string()),
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(value.to_string()),
                             ],
                         ),
@@ -561,21 +563,14 @@ struct PlayersGetExecutor;
 impl CommandExecutor for PlayersGetExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGET).await?;
+            let player_name =
+                ScoreHolderArgumentType::get_score_holder(context, ARG_TARGET).await?;
             let objective_name = obj_name(context)?;
-
-            // `players get` with empty targets is a parse error (EntityArgumentType requires at least 1)
-            if targets.is_empty() {
-                return Err(OBJECTIVE_NOT_FOUND_ERROR.create_without_context());
-            }
-
-            let player = &targets[0];
-            let player_name = &player.gameprofile.name;
 
             let world = context.world();
             let scoreboard = world.scoreboard.lock().await;
 
-            let Some(score_info) = scoreboard.get_player_score_info(player_name, objective_name)
+            let Some(score_info) = scoreboard.get_player_score_info(&player_name, objective_name)
             else {
                 return Err(NO_VALUE_ERROR.create_without_context(
                     TextComponent::text(objective_name.to_string()),
@@ -593,7 +588,7 @@ impl CommandExecutor for PlayersGetExecutor {
                         translation::java::COMMANDS_SCOREBOARD_PLAYERS_GET_SUCCESS,
                         [
                             TextComponent::text(objective_name.to_string()),
-                            TextComponent::text(player_name.clone()),
+                            TextComponent::text(player_name),
                             TextComponent::text(value.to_string()),
                         ],
                     ),
@@ -611,7 +606,7 @@ struct PlayersAddExecutor;
 impl CommandExecutor for PlayersAddExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let add_value = IntegerArgumentType::get(context, ARG_SCORE)?;
 
@@ -625,12 +620,11 @@ impl CommandExecutor for PlayersAddExecutor {
             let obj_display = objective.display_name.clone();
             let _ = objective;
 
-            let mut result = 0;
-            for player in &targets {
-                let player_name = &player.gameprofile.name;
+            let mut result: i32 = 0;
+            for player_name in &targets {
                 let existing = scoreboard.get_player_score_info(player_name, objective_name);
                 let current = existing.map_or(0, |s| s.value.0);
-                let new_value = current + add_value;
+                let new_value = current.wrapping_add(add_value);
 
                 let score = ScoreboardScore {
                     entity_name: Arc::from(player_name.as_str()),
@@ -641,7 +635,7 @@ impl CommandExecutor for PlayersAddExecutor {
                     locked: existing.is_none_or(|s| s.locked),
                 };
                 scoreboard.update_score(world, score).await;
-                result += new_value;
+                result = result.wrapping_add(new_value);
             }
 
             if targets.len() == 1 {
@@ -654,7 +648,7 @@ impl CommandExecutor for PlayersAddExecutor {
                             [
                                 TextComponent::text(add_value.to_string()),
                                 obj_display,
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(result.to_string()),
                             ],
                         ),
@@ -689,7 +683,7 @@ struct PlayersRemoveExecutor;
 impl CommandExecutor for PlayersRemoveExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let remove_value = IntegerArgumentType::get(context, ARG_SCORE)?;
 
@@ -703,12 +697,11 @@ impl CommandExecutor for PlayersRemoveExecutor {
             let obj_display = objective.display_name.clone();
             let _ = objective;
 
-            let mut result = 0;
-            for player in &targets {
-                let player_name = &player.gameprofile.name;
+            let mut result: i32 = 0;
+            for player_name in &targets {
                 let existing = scoreboard.get_player_score_info(player_name, objective_name);
                 let current = existing.map_or(0, |s| s.value.0);
-                let new_value = current - remove_value;
+                let new_value = current.wrapping_sub(remove_value);
 
                 let score = ScoreboardScore {
                     entity_name: Arc::from(player_name.as_str()),
@@ -719,7 +712,7 @@ impl CommandExecutor for PlayersRemoveExecutor {
                     locked: existing.is_none_or(|s| s.locked),
                 };
                 scoreboard.update_score(world, score).await;
-                result += new_value;
+                result = result.wrapping_add(new_value);
             }
 
             if targets.len() == 1 {
@@ -732,7 +725,7 @@ impl CommandExecutor for PlayersRemoveExecutor {
                             [
                                 TextComponent::text(remove_value.to_string()),
                                 obj_display,
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(result.to_string()),
                             ],
                         ),
@@ -767,12 +760,12 @@ struct PlayersResetAllExecutor;
 impl CommandExecutor for PlayersResetAllExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
-                scoreboard.reset_all_player_scores(world, &player.gameprofile.name);
+            for player_name in &targets {
+                scoreboard.reset_all_player_scores(world, player_name);
             }
 
             if targets.len() == 1 {
@@ -782,7 +775,7 @@ impl CommandExecutor for PlayersResetAllExecutor {
                         TextComponent::translate_cross(
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_RESET_ALL_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_RESET_ALL_SINGLE,
-                            [TextComponent::text(targets[0].gameprofile.name.clone())],
+                            [TextComponent::text(targets[0].clone())],
                         ),
                         true,
                     )
@@ -811,17 +804,13 @@ struct PlayersResetSingleExecutor;
 impl CommandExecutor for PlayersResetSingleExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
-                scoreboard.reset_single_player_score(
-                    world,
-                    &player.gameprofile.name,
-                    objective_name,
-                );
+            for player_name in &targets {
+                scoreboard.reset_single_player_score(world, player_name, objective_name);
             }
 
             let obj_display = TextComponent::text(objective_name.to_string());
@@ -832,10 +821,7 @@ impl CommandExecutor for PlayersResetSingleExecutor {
                         TextComponent::translate_cross(
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_RESET_SPECIFIC_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_RESET_SPECIFIC_SINGLE,
-                            [
-                                obj_display,
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
-                            ],
+                            [obj_display, TextComponent::text(targets[0].clone())],
                         ),
                         true,
                     )
@@ -907,14 +893,11 @@ struct PlayersListTargetExecutor;
 impl CommandExecutor for PlayersListTargetExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
-            if targets.is_empty() {
-                return Err(INVALID_ENABLE_ERROR.create_without_context());
-            }
-            let player_name = &targets[0].gameprofile.name;
+            let player_name =
+                ScoreHolderArgumentType::get_score_holder(context, ARG_TARGETS).await?;
 
             let scoreboard = context.world().scoreboard.lock().await;
-            let scores = scoreboard.list_scores_for_player(player_name);
+            let scores = scoreboard.list_scores_for_player(&player_name);
 
             if scores.is_empty() {
                 context
@@ -936,7 +919,7 @@ impl CommandExecutor for PlayersListTargetExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_LIST_ENTITY_SUCCESS,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_LIST_ENTITY_SUCCESS,
                             [
-                                TextComponent::text(player_name.clone()),
+                                TextComponent::text(player_name),
                                 TextComponent::text(scores.len().to_string()),
                             ],
                         ),
@@ -972,17 +955,17 @@ struct PlayersDisplayNameSetExecutor;
 impl CommandExecutor for PlayersDisplayNameSetExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let name = TextComponent::text(StringArgumentType::get(context, "name")?.to_string());
 
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
+            for player_name in &targets {
                 scoreboard.set_score_display_name(
                     world,
-                    &player.gameprofile.name,
+                    player_name,
                     objective_name,
                     Some(name.clone()),
                 );
@@ -997,7 +980,7 @@ impl CommandExecutor for PlayersDisplayNameSetExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NAME_SET_SUCCESS_SINGLE,
                             [
                                 name,
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1032,19 +1015,14 @@ struct PlayersDisplayNameClearExecutor;
 impl CommandExecutor for PlayersDisplayNameClearExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
 
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
-                scoreboard.set_score_display_name(
-                    world,
-                    &player.gameprofile.name,
-                    objective_name,
-                    None,
-                );
+            for player_name in &targets {
+                scoreboard.set_score_display_name(world, player_name, objective_name, None);
             }
 
             if targets.len() == 1 {
@@ -1055,7 +1033,7 @@ impl CommandExecutor for PlayersDisplayNameClearExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NAME_CLEAR_SUCCESS_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NAME_CLEAR_SUCCESS_SINGLE,
                             [
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1090,48 +1068,136 @@ const ARG_SOURCE_OBJECTIVE: &str = "sourceObjective";
 fn operation_source_args(
     executor: impl CommandExecutor + 'static,
 ) -> crate::command::argument_builder::RequiredArgumentBuilder {
-    argument(ARG_SOURCE, EntityArgumentType::Players)
+    argument(ARG_SOURCE, ScoreHolderArgumentType::Multiple)
         .then(argument(ARG_SOURCE_OBJECTIVE, ObjectiveArgumentType).executes(executor))
 }
 
-/// Applies an operation to all targets. `op` is `|a, b| -> i32`.
+#[derive(Clone, Copy)]
+enum ScoreOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Assign,
+    Minimum,
+    Maximum,
+    Swap,
+}
+
+impl ScoreOperation {
+    fn apply(self, target: i32, source: i32) -> Result<i32, CommandSyntaxError> {
+        match self {
+            Self::Add => Ok(target.wrapping_add(source)),
+            Self::Subtract => Ok(target.wrapping_sub(source)),
+            Self::Multiply => Ok(target.wrapping_mul(source)),
+            Self::Divide => floor_div(target, source),
+            Self::Modulo => positive_modulo(target, source),
+            Self::Assign | Self::Swap => Ok(source),
+            Self::Minimum => Ok(target.min(source)),
+            Self::Maximum => Ok(target.max(source)),
+        }
+    }
+}
+
+fn floor_div(dividend: i32, divisor: i32) -> Result<i32, CommandSyntaxError> {
+    if divisor == 0 {
+        return Err(DIVIDE_BY_ZERO_ERROR.create_without_context());
+    }
+    let quotient = dividend.wrapping_div(divisor);
+    let remainder = dividend.wrapping_rem(divisor);
+    if remainder != 0 && (remainder < 0) != (divisor < 0) {
+        Ok(quotient.wrapping_sub(1))
+    } else {
+        Ok(quotient)
+    }
+}
+
+fn positive_modulo(dividend: i32, divisor: i32) -> Result<i32, CommandSyntaxError> {
+    if divisor == 0 {
+        return Err(DIVIDE_BY_ZERO_ERROR.create_without_context());
+    }
+    let remainder = dividend.wrapping_rem(divisor);
+    if remainder != 0 && (remainder < 0) != (divisor < 0) {
+        Ok(remainder.wrapping_add(divisor))
+    } else {
+        Ok(remainder)
+    }
+}
+
+fn score_with_value(
+    existing: Option<&ScoreboardScore>,
+    holder: &str,
+    objective: &str,
+    value: i32,
+) -> ScoreboardScore {
+    ScoreboardScore {
+        entity_name: Arc::from(holder),
+        objective_name: Arc::from(objective),
+        value: VarInt(value),
+        display_name: existing.and_then(|score| score.display_name.clone()),
+        number_format: existing.and_then(|score| score.number_format.clone()),
+        locked: existing.is_none_or(|score| score.locked),
+    }
+}
+
 async fn apply_operation(
     context: &CommandContext<'_>,
-    op: impl Fn(i32, i32) -> i32 + Send + Sync,
+    operation: ScoreOperation,
 ) -> Result<i32, crate::command::errors::command_syntax_error::CommandSyntaxError> {
-    let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+    let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
     let objective_name = obj_name(context)?;
-    let sources = EntityArgumentType::get_players(context, ARG_SOURCE).await?;
-    let source_objective = obj_name(context)?;
+    let sources = ScoreHolderArgumentType::get_score_holders(context, ARG_SOURCE).await?;
+    let source_objective = ObjectiveArgumentType::get(context, ARG_SOURCE_OBJECTIVE)?;
 
     let world = context.world();
     let mut scoreboard = world.scoreboard.lock().await;
 
+    if !scoreboard.get_objectives().contains_key(objective_name)
+        || !scoreboard.get_objectives().contains_key(source_objective)
+    {
+        return Err(OBJECTIVE_NOT_FOUND_ERROR.create_without_context());
+    }
+
     let mut last_new_value = 0;
-    for target in &targets {
-        let target_name = &target.gameprofile.name;
-        for source in &sources {
-            let source_name = &source.gameprofile.name;
-            let source_value = scoreboard
+    for target_name in &targets {
+        for source_name in &sources {
+            let Some(source_score) = scoreboard
                 .get_player_score_info(source_name, source_objective)
-                .map_or(0, |s| s.value.0);
-            let current = scoreboard
+                .cloned()
+            else {
+                return Err(NO_VALUE_ERROR.create_without_context(
+                    TextComponent::text(source_objective.to_string()),
+                    TextComponent::text(source_name.clone()),
+                ));
+            };
+            let target_score = scoreboard
                 .get_player_score_info(target_name, objective_name)
-                .map_or(0, |s| s.value.0);
-            let new_value = op(current, source_value);
+                .cloned();
+            let current = target_score.as_ref().map_or(0, |score| score.value.0);
+            let source_value = source_score.value.0;
+            let new_value = operation.apply(current, source_value)?;
             last_new_value = new_value;
 
-            let score = ScoreboardScore {
-                entity_name: Arc::from(target_name.as_str()),
-                objective_name: Arc::from(objective_name),
-                value: VarInt(new_value),
-                display_name: None,
-                number_format: None,
-                locked: false,
-            };
-            scoreboard.update_score(world, score).await;
+            let target_update = score_with_value(
+                target_score.as_ref(),
+                target_name,
+                objective_name,
+                new_value,
+            );
+            scoreboard.update_score(world, target_update).await;
+
+            if matches!(operation, ScoreOperation::Swap)
+                && (target_name != source_name || objective_name != source_objective)
+            {
+                let source_update =
+                    score_with_value(Some(&source_score), source_name, source_objective, current);
+                scoreboard.update_score(world, source_update).await;
+            }
         }
     }
+
+    drop(scoreboard);
 
     if targets.len() == 1 {
         context
@@ -1142,7 +1208,7 @@ async fn apply_operation(
                     translation::java::COMMANDS_SCOREBOARD_PLAYERS_OPERATION_SUCCESS_SINGLE,
                     [
                         TextComponent::text(objective_name.to_string()),
-                        TextComponent::text(targets[0].gameprofile.name.clone()),
+                        TextComponent::text(targets[0].clone()),
                         TextComponent::text(last_new_value.to_string()),
                     ],
                 ),
@@ -1170,33 +1236,25 @@ async fn apply_operation(
 }
 
 macro_rules! make_operation_executor {
-    ($name:ident, $op:expr) => {
+    ($name:ident, $operation:expr) => {
         struct $name;
         impl CommandExecutor for $name {
             fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
-                Box::pin(apply_operation(context, $op))
+                Box::pin(apply_operation(context, $operation))
             }
         }
     };
 }
 
-make_operation_executor!(PlayersOperationAddExecutor, |a, b| a + b);
-make_operation_executor!(PlayersOperationSubExecutor, |a, b| a - b);
-make_operation_executor!(PlayersOperationMulExecutor, |a, b| a * b);
-make_operation_executor!(PlayersOperationDivExecutor, |a, b| if b == 0 {
-    0
-} else {
-    a / b
-});
-make_operation_executor!(PlayersOperationModExecutor, |a, b| if b == 0 {
-    0
-} else {
-    a % b
-});
-make_operation_executor!(PlayersOperationAssignExecutor, |_a, b| b);
-make_operation_executor!(PlayersOperationMinExecutor, Ord::min);
-make_operation_executor!(PlayersOperationMaxExecutor, Ord::max);
-make_operation_executor!(PlayersOperationIfExecutor, |_a, b| b);
+make_operation_executor!(PlayersOperationAddExecutor, ScoreOperation::Add);
+make_operation_executor!(PlayersOperationSubExecutor, ScoreOperation::Subtract);
+make_operation_executor!(PlayersOperationMulExecutor, ScoreOperation::Multiply);
+make_operation_executor!(PlayersOperationDivExecutor, ScoreOperation::Divide);
+make_operation_executor!(PlayersOperationModExecutor, ScoreOperation::Modulo);
+make_operation_executor!(PlayersOperationAssignExecutor, ScoreOperation::Assign);
+make_operation_executor!(PlayersOperationMinExecutor, ScoreOperation::Minimum);
+make_operation_executor!(PlayersOperationMaxExecutor, ScoreOperation::Maximum);
+make_operation_executor!(PlayersOperationSwapExecutor, ScoreOperation::Swap);
 
 struct ModifyObjectiveNumberFormatClearExecutor;
 struct ModifyObjectiveNumberFormatBlankExecutor;
@@ -1392,19 +1450,14 @@ struct PlayersDisplayNumberFormatStyledExecutor;
 impl CommandExecutor for PlayersDisplayNumberFormatClearExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
 
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
-                scoreboard.set_score_number_format(
-                    world,
-                    &player.gameprofile.name,
-                    objective_name,
-                    None,
-                );
+            for player_name in &targets {
+                scoreboard.set_score_number_format(world, player_name, objective_name, None);
             }
 
             if targets.len() == 1 {
@@ -1415,7 +1468,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatClearExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_CLEAR_SUCCESS_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_CLEAR_SUCCESS_SINGLE,
                             [
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1447,16 +1500,16 @@ impl CommandExecutor for PlayersDisplayNumberFormatClearExecutor {
 impl CommandExecutor for PlayersDisplayNumberFormatBlankExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
 
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
+            for player_name in &targets {
                 scoreboard.set_score_number_format(
                     world,
-                    &player.gameprofile.name,
+                    player_name,
                     objective_name,
                     Some(NumberFormat::Blank),
                 );
@@ -1470,7 +1523,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatBlankExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             [
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1502,7 +1555,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatBlankExecutor {
 impl CommandExecutor for PlayersDisplayNumberFormatFixedExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let contents =
                 TextComponent::text(StringArgumentType::get(context, "contents")?.to_string());
@@ -1510,10 +1563,10 @@ impl CommandExecutor for PlayersDisplayNumberFormatFixedExecutor {
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
+            for player_name in &targets {
                 scoreboard.set_score_number_format(
                     world,
-                    &player.gameprofile.name,
+                    player_name,
                     objective_name,
                     Some(NumberFormat::Fixed(contents.clone())),
                 );
@@ -1527,7 +1580,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatFixedExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             [
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1559,7 +1612,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatFixedExecutor {
 impl CommandExecutor for PlayersDisplayNumberFormatStyledExecutor {
     fn execute<'a>(&'a self, context: &'a CommandContext) -> CommandExecutorResult<'a> {
         Box::pin(async move {
-            let targets = EntityArgumentType::get_players(context, ARG_TARGETS).await?;
+            let targets = ScoreHolderArgumentType::get_score_holders(context, ARG_TARGETS).await?;
             let objective_name = obj_name(context)?;
             let style_json = StringArgumentType::get(context, "style")?.to_string();
             let style: pumpkin_util::text::style::Style = serde_json::from_str(&style_json)
@@ -1568,10 +1621,10 @@ impl CommandExecutor for PlayersDisplayNumberFormatStyledExecutor {
             let world = context.world();
             let mut scoreboard = world.scoreboard.lock().await;
 
-            for player in &targets {
+            for player_name in &targets {
                 scoreboard.set_score_number_format(
                     world,
-                    &player.gameprofile.name,
+                    player_name,
                     objective_name,
                     Some(NumberFormat::Styled(style.clone())),
                 );
@@ -1585,7 +1638,7 @@ impl CommandExecutor for PlayersDisplayNumberFormatStyledExecutor {
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             translation::java::COMMANDS_SCOREBOARD_PLAYERS_DISPLAY_NUMBERFORMAT_SET_SUCCESS_SINGLE,
                             [
-                                TextComponent::text(targets[0].gameprofile.name.clone()),
+                                TextComponent::text(targets[0].clone()),
                                 TextComponent::text(objective_name.to_string()),
                             ],
                         ),
@@ -1654,7 +1707,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     .then(
                         literal("add").then(
                             argument(ARG_OBJECTIVE, StringArgumentType::SingleWord).then(
-                                argument(ARG_CRITERION, StringArgumentType::SingleWord)
+                                argument(ARG_CRITERION, ObjectiveCriteriaArgumentType)
                                     .executes(ObjectivesAddExecutor {
                                         has_display_name: false,
                                     })
@@ -1746,13 +1799,13 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                 literal("players")
                     .then(
                         literal("list").executes(PlayersListExecutor).then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players)
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Single)
                                 .executes(PlayersListTargetExecutor),
                         ),
                     )
                     .then(
                         literal("set").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType).then(
                                     argument(ARG_SCORE, IntegerArgumentType::any())
                                         .executes(PlayersSetExecutor),
@@ -1762,7 +1815,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     )
                     .then(
                         literal("get").then(
-                            argument(ARG_TARGET, EntityArgumentType::Player).then(
+                            argument(ARG_TARGET, ScoreHolderArgumentType::Single).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType)
                                     .executes(PlayersGetExecutor),
                             ),
@@ -1770,7 +1823,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     )
                     .then(
                         literal("add").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType).then(
                                     argument(ARG_SCORE, IntegerArgumentType::with_min(0))
                                         .executes(PlayersAddExecutor),
@@ -1780,7 +1833,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     )
                     .then(
                         literal("remove").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType).then(
                                     argument(ARG_SCORE, IntegerArgumentType::with_min(0))
                                         .executes(PlayersRemoveExecutor),
@@ -1790,7 +1843,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     )
                     .then(
                         literal("reset").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players)
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple)
                                 .executes(PlayersResetAllExecutor)
                                 .then(
                                     argument(ARG_OBJECTIVE, ObjectiveArgumentType)
@@ -1801,7 +1854,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     .then(
                         literal("display").then(
                             literal("name").then(
-                                argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                                argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                     argument(ARG_OBJECTIVE, ObjectiveArgumentType)
                                         .executes(PlayersDisplayNameClearExecutor)
                                         .then(
@@ -1813,7 +1866,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                         )
                         .then(
                             literal("numberformat").then(
-                                argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                                argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                     argument(ARG_OBJECTIVE, ObjectiveArgumentType)
                                         .executes(PlayersDisplayNumberFormatClearExecutor)
                                         .then(literal("blank").executes(
@@ -1837,41 +1890,41 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     )
                     .then(
                         literal("operation").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType).then(
                                     literal("+=")
-                                        .then(operation_source_args(PlayersOperationAddExecutor))
-                                        .then(literal("-=").then(operation_source_args(
-                                            PlayersOperationSubExecutor,
-                                        )))
-                                        .then(literal("*=").then(operation_source_args(
-                                            PlayersOperationMulExecutor,
-                                        )))
-                                        .then(literal("/=").then(operation_source_args(
-                                            PlayersOperationDivExecutor,
-                                        )))
-                                        .then(literal("%=").then(operation_source_args(
-                                            PlayersOperationModExecutor,
-                                        )))
-                                        .then(literal("=").then(operation_source_args(
-                                            PlayersOperationAssignExecutor,
-                                        )))
-                                        .then(literal("<").then(operation_source_args(
-                                            PlayersOperationMinExecutor,
-                                        )))
-                                        .then(literal(">").then(operation_source_args(
-                                            PlayersOperationMaxExecutor,
-                                        )))
-                                        .then(literal("?").then(operation_source_args(
-                                            PlayersOperationIfExecutor,
-                                        ))),
-                                ),
+                                        .then(operation_source_args(PlayersOperationAddExecutor)),
+                                )
+                                .then(literal("-=").then(operation_source_args(
+                                    PlayersOperationSubExecutor,
+                                )))
+                                .then(literal("*=").then(operation_source_args(
+                                    PlayersOperationMulExecutor,
+                                )))
+                                .then(literal("/=").then(operation_source_args(
+                                    PlayersOperationDivExecutor,
+                                )))
+                                .then(literal("%=").then(operation_source_args(
+                                    PlayersOperationModExecutor,
+                                )))
+                                .then(literal("=").then(operation_source_args(
+                                    PlayersOperationAssignExecutor,
+                                )))
+                                .then(literal("<").then(operation_source_args(
+                                    PlayersOperationMinExecutor,
+                                )))
+                                .then(literal(">").then(operation_source_args(
+                                    PlayersOperationMaxExecutor,
+                                )))
+                                .then(literal("><").then(operation_source_args(
+                                    PlayersOperationSwapExecutor,
+                                ))),
                             ),
                         ),
                     )
                     .then(
                         literal("enable").then(
-                            argument(ARG_TARGETS, EntityArgumentType::Players).then(
+                            argument(ARG_TARGETS, ScoreHolderArgumentType::Multiple).then(
                                 argument(ARG_OBJECTIVE, ObjectiveArgumentType)
                                     .executes(PlayersEnableExecutor),
                             ),
@@ -1879,4 +1932,19 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
                     ),
             ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{floor_div, positive_modulo};
+
+    #[test]
+    fn operations_use_vanilla_floor_arithmetic() {
+        assert_eq!(floor_div(-5, 2).expect("nonzero divisor"), -3);
+        assert_eq!(floor_div(5, -2).expect("nonzero divisor"), -3);
+        assert_eq!(positive_modulo(-5, 2).expect("nonzero divisor"), 1);
+        assert_eq!(positive_modulo(5, -2).expect("nonzero divisor"), -1);
+        assert!(floor_div(1, 0).is_err());
+        assert!(positive_modulo(1, 0).is_err());
+    }
 }

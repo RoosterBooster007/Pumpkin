@@ -16,10 +16,21 @@ use tracing::warn;
 
 use super::World;
 
-/// Returns `true` if the criterion name is valid (either a known built-in
-/// or matches the `stat.*` or `teamkill.*` / `killedByTeam.*` patterns).
+/// Returns `true` if the criterion name is valid (either a known built-in,
+/// a modern statistic criterion, or a team-kill criterion).
 #[must_use]
 pub fn is_valid_criterion(criterion: &str) -> bool {
+    const STAT_TYPES: &[&str] = &[
+        "minecraft.mined",
+        "minecraft.crafted",
+        "minecraft.used",
+        "minecraft.broken",
+        "minecraft.picked_up",
+        "minecraft.dropped",
+        "minecraft.killed",
+        "minecraft.killed_by",
+        "minecraft.custom",
+    ];
     const BUILT_IN_CRITERIA: &[&str] = &[
         "dummy",
         "trigger",
@@ -65,13 +76,59 @@ pub fn is_valid_criterion(criterion: &str) -> bool {
         }
     }
 
-    // Stat criteria: stat.<stat_type>.<stat>
-    let parts: Vec<&str> = criterion.split('.').collect();
-    if parts.len() >= 3 && parts[0] == "stat" {
-        return true;
-    }
+    let Some((stat_type, stat)) = criterion.split_once(':') else {
+        return false;
+    };
+    STAT_TYPES.contains(&stat_type) && is_encoded_resource_location(stat)
+}
 
-    false
+fn is_encoded_resource_location(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(namespace, path)| {
+        !namespace.is_empty()
+            && !path.is_empty()
+            && namespace.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+            && path.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-/.".contains(&byte)
+            })
+    })
+}
+
+fn pascal_case_to_snake_case(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() + 4);
+    for (index, character) in value.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index != 0 {
+                result.push('_');
+            }
+            result.push(character.to_ascii_lowercase());
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
+/// Converts a statistic update to the criterion name stored by vanilla.
+///
+/// Item, block, and entity statistic names need their registry identifiers;
+/// custom statistics can be mapped directly from their generated enum.
+#[must_use]
+pub fn statistic_criterion(
+    category: pumpkin_data::statistic::StatisticCategory,
+    statistic: i32,
+) -> Option<String> {
+    use pumpkin_data::statistic::{CustomStatistic, StatisticCategory};
+
+    if category != StatisticCategory::Custom {
+        return None;
+    }
+    let statistic = CustomStatistic::from_i32(statistic)?;
+    Some(format!(
+        "minecraft.custom:minecraft.{}",
+        pascal_case_to_snake_case(&format!("{statistic:?}"))
+    ))
 }
 
 /// Returns the default [`RenderType`] for a built-in criterion.
@@ -391,22 +448,22 @@ impl Scoreboard {
             if !self.tracked_objectives.contains(name) {
                 self.start_tracking_objective(world, name);
             }
-        } else if let Some(ref old_name) = old_objective {
-            // Clearing a slot. If the old objective had no other
-            // display slots, it gets untracked (remove packet sent).
-            let has_other_slots = self
-                .display_objectives
-                .iter()
-                .any(|(s, v)| s != &slot && v.as_deref() == Some(old_name.as_str()));
-            if !has_other_slots {
-                self.stop_tracking_objective(world, old_name);
-            }
         }
 
         let je_packet = CDisplayObjective::new(slot, score_name.to_string());
         world.broadcast_packet_all(&je_packet);
         self.display_objectives
             .insert(slot, objective_name.map(ToString::to_string));
+
+        if let Some(old_name) = old_objective
+            && objective_name != Some(old_name.as_str())
+            && !self
+                .display_objectives
+                .values()
+                .any(|displayed| displayed.as_deref() == Some(old_name.as_str()))
+        {
+            self.stop_tracking_objective(world, &old_name);
+        }
     }
 
     /// Returns the name of the objective currently displayed in the given slot, or `None`.
@@ -598,6 +655,27 @@ impl Scoreboard {
     /// Sends the full scoreboard state (all tracked objectives + display slots + scores)
     /// to a single player. Called when a player joins the world.
     pub fn send_state_to_player(&self, player: &crate::entity::player::Player) {
+        // Teams are global scoreboard state too, and must be created client-side
+        // before later membership or update packets can refer to them.
+        for team in self.teams.values() {
+            let parameters = TeamParameters {
+                display_name: &team.display_name,
+                options: team.options,
+                nametag_visibility: team.nametag_visibility.to_str(),
+                collision_rule: team.collision_rule.to_str(),
+                color: team.color as i32,
+                player_prefix: &team.player_prefix,
+                player_suffix: &team.player_suffix,
+            };
+            let packet = CSetPlayerTeam {
+                team_name: team.name.clone(),
+                method: TeamMethod::Create,
+                parameters: Some(parameters),
+                players: team.players.clone().into(),
+            };
+            player.client.try_enqueue_packet(&packet);
+        }
+
         // Send all tracked objectives (create packet + scores)
         for objective_name in &self.tracked_objectives {
             let Some(objective) = self.objectives.get(objective_name.as_str()) else {
@@ -641,28 +719,35 @@ impl Scoreboard {
     pub fn to_data(&self) -> pumpkin_world::world_info::data_files::ScoreboardData {
         use pumpkin_protocol::java::client::play::RenderType;
         use pumpkin_world::world_info::data_files::{
-            SerializableObjective, SerializableScore, SerializableTeam,
+            SerializableNumberFormat, SerializableObjective, SerializableScore, SerializableTeam,
+            SerializableTextComponent,
         };
+
+        fn serialize_number_format(format: &NumberFormat) -> SerializableNumberFormat {
+            match format {
+                NumberFormat::Blank => SerializableNumberFormat::Blank,
+                NumberFormat::Styled(style) => SerializableNumberFormat::Styled {
+                    style: style.clone(),
+                },
+                NumberFormat::Fixed(value) => SerializableNumberFormat::Fixed {
+                    value: SerializableTextComponent(value.clone()),
+                },
+            }
+        }
 
         let objectives = self
             .objectives
             .values()
-            .map(|obj| {
-                let display_json = serde_json::to_string(&obj.display_name).unwrap_or_default();
-                SerializableObjective {
-                    name: obj.name.to_string(),
-                    display_name: display_json,
-                    render_type: match obj.render_type {
-                        RenderType::Integer => "integer".to_string(),
-                        RenderType::Hearts => "hearts".to_string(),
-                    },
-                    criteria_name: obj.criterion.to_string(),
-                    display_auto_update: obj.display_auto_update,
-                    number_format: obj
-                        .number_format
-                        .as_ref()
-                        .map(|nf| serde_json::to_string(nf).unwrap_or_default()),
-                }
+            .map(|obj| SerializableObjective {
+                name: obj.name.to_string(),
+                display_name: SerializableTextComponent(obj.display_name.clone()),
+                render_type: match obj.render_type {
+                    RenderType::Integer => "integer".to_string(),
+                    RenderType::Hearts => "hearts".to_string(),
+                },
+                criteria_name: obj.criterion.to_string(),
+                display_auto_update: obj.display_auto_update,
+                number_format: obj.number_format.as_ref().map(serialize_number_format),
             })
             .collect();
 
@@ -674,14 +759,8 @@ impl Scoreboard {
                     objective_name: obj_name.clone(),
                     value: score.value.0,
                     locked: score.locked,
-                    display: score
-                        .display_name
-                        .as_ref()
-                        .map(|d| serde_json::to_string(d).unwrap_or_default()),
-                    number_format: score
-                        .number_format
-                        .as_ref()
-                        .map(|nf| serde_json::to_string(nf).unwrap_or_default()),
+                    display: score.display_name.clone().map(SerializableTextComponent),
+                    number_format: score.number_format.as_ref().map(serialize_number_format),
                 });
             }
         }
@@ -689,13 +768,18 @@ impl Scoreboard {
         let teams = self
             .teams
             .values()
-            .map(|t| {
-                let display_json = serde_json::to_string(&t.display_name).unwrap_or_default();
-                SerializableTeam {
-                    name: t.name.clone(),
-                    display_name: display_json,
-                    players: t.players.clone(),
-                }
+            .map(|t| SerializableTeam {
+                name: t.name.clone(),
+                display_name: SerializableTextComponent(t.display_name.clone()),
+                color: t.color,
+                allow_friendly_fire: (t.options & 0x01) != 0,
+                see_friendly_invisibles: (t.options & 0x02) != 0,
+                player_prefix: SerializableTextComponent(t.player_prefix.clone()),
+                player_suffix: SerializableTextComponent(t.player_suffix.clone()),
+                nametag_visibility: t.nametag_visibility.to_str().to_string(),
+                death_message_visibility: t.death_message_visibility.to_str().to_string(),
+                collision_rule: t.collision_rule.to_str().to_string(),
+                players: t.players.clone(),
             })
             .collect();
 
@@ -719,6 +803,15 @@ impl Scoreboard {
     /// Populates this scoreboard from serialized data (loaded from disk).
     pub fn load_from_data(&mut self, data: &pumpkin_world::world_info::data_files::ScoreboardData) {
         use pumpkin_protocol::java::client::play::RenderType;
+        use pumpkin_world::world_info::data_files::SerializableNumberFormat;
+
+        fn deserialize_number_format(format: &SerializableNumberFormat) -> NumberFormat {
+            match format {
+                SerializableNumberFormat::Blank => NumberFormat::Blank,
+                SerializableNumberFormat::Styled { style } => NumberFormat::Styled(style.clone()),
+                SerializableNumberFormat::Fixed { value } => NumberFormat::Fixed(value.0.clone()),
+            }
+        }
 
         // Clear existing data
         self.objectives.clear();
@@ -735,15 +828,10 @@ impl Scoreboard {
             } else {
                 RenderType::Integer
             };
-            let display_name = serde_json::from_str(&obj.display_name)
-                .unwrap_or_else(|_| TextComponent::text(obj.display_name.clone()));
-            let number_format = obj
-                .number_format
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let number_format = obj.number_format.as_ref().map(deserialize_number_format);
             let mut objective = ScoreboardObjective::new(
                 Arc::from(obj.name.as_str()),
-                display_name,
+                obj.display_name.0.clone(),
                 render_type,
                 number_format,
                 Arc::from(obj.criteria_name.as_str()),
@@ -759,14 +847,7 @@ impl Scoreboard {
 
         // Load scores
         for score in &data.scores {
-            let display_name = score
-                .display
-                .as_ref()
-                .and_then(|d| serde_json::from_str(d).ok());
-            let number_format = score
-                .number_format
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let number_format = score.number_format.as_ref().map(deserialize_number_format);
             let entry = self.scores.entry(score.objective_name.clone()).or_default();
             entry.insert(
                 score.entity_name.clone(),
@@ -774,7 +855,7 @@ impl Scoreboard {
                     entity_name: Arc::from(score.entity_name.as_str()),
                     objective_name: Arc::from(score.objective_name.as_str()),
                     value: VarInt(score.value),
-                    display_name,
+                    display_name: score.display.as_ref().map(|display| display.0.clone()),
                     number_format,
                     locked: score.locked,
                 },
@@ -783,19 +864,27 @@ impl Scoreboard {
 
         // Load teams
         for team in &data.teams {
-            let display_name = serde_json::from_str(&team.display_name)
-                .unwrap_or_else(|_| TextComponent::text(team.display_name.clone()));
+            let mut options = 0;
+            if team.allow_friendly_fire {
+                options |= 0x01;
+            }
+            if team.see_friendly_invisibles {
+                options |= 0x02;
+            }
             self.teams.insert(
                 team.name.clone(),
                 Team {
                     name: team.name.clone(),
-                    display_name,
-                    options: 0,
-                    nametag_visibility: crate::world::scoreboard::NameTagVisibility::Always,
-                    collision_rule: crate::world::scoreboard::CollisionRule::Always,
-                    color: NamedColor::White,
-                    player_prefix: TextComponent::empty(),
-                    player_suffix: TextComponent::empty(),
+                    display_name: team.display_name.0.clone(),
+                    options,
+                    nametag_visibility: NameTagVisibility::from_name(&team.nametag_visibility),
+                    death_message_visibility: NameTagVisibility::from_name(
+                        &team.death_message_visibility,
+                    ),
+                    collision_rule: CollisionRule::from_name(&team.collision_rule),
+                    color: team.color,
+                    player_prefix: team.player_prefix.0.clone(),
+                    player_suffix: team.player_suffix.0.clone(),
                     players: team.players.clone(),
                 },
             );
@@ -964,13 +1053,28 @@ impl Scoreboard {
     }
 
     pub fn add_player_to_team(&mut self, world: &World, team_name: &str, player: String) {
-        let Some(team) = self.teams.get_mut(team_name) else {
+        if !self.teams.contains_key(team_name) {
             warn!(
                 "Tried to add player to Team which does not exist, {}",
                 team_name
             );
             return;
-        };
+        }
+
+        let previous_teams: Vec<String> = self
+            .teams
+            .iter()
+            .filter(|(name, team)| *name != team_name && team.players.contains(&player))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for previous_team in previous_teams {
+            self.remove_player_from_team(world, &previous_team, &player);
+        }
+
+        let team = self
+            .teams
+            .get_mut(team_name)
+            .expect("team existence was checked");
 
         if team.players.contains(&player) {
             return;
@@ -1039,6 +1143,7 @@ impl ScoreboardObjective {
     }
 }
 
+#[derive(Clone)]
 pub struct ScoreboardScore {
     pub entity_name: Arc<str>,
     pub objective_name: Arc<str>,
@@ -1086,6 +1191,16 @@ impl NameTagVisibility {
             Self::HideForOwnTeam => "hideForOwnTeam",
         }
     }
+
+    #[must_use]
+    pub fn from_name(value: &str) -> Self {
+        match value {
+            "never" => Self::Never,
+            "hideForOtherTeams" => Self::HideForOtherTeams,
+            "hideForOwnTeam" => Self::HideForOwnTeam,
+            _ => Self::Always,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1106,6 +1221,16 @@ impl CollisionRule {
             Self::PushOwnTeam => "pushOwnTeam",
         }
     }
+
+    #[must_use]
+    pub fn from_name(value: &str) -> Self {
+        match value {
+            "never" => Self::Never,
+            "pushOtherTeams" => Self::PushOtherTeams,
+            "pushOwnTeam" => Self::PushOwnTeam,
+            _ => Self::Always,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1114,9 +1239,39 @@ pub struct Team {
     pub display_name: TextComponent,
     pub options: i8,
     pub nametag_visibility: NameTagVisibility,
+    pub death_message_visibility: NameTagVisibility,
     pub collision_rule: CollisionRule,
     pub color: NamedColor,
     pub player_prefix: TextComponent,
     pub player_suffix: TextComponent,
     pub players: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_criterion, statistic_criterion};
+    use pumpkin_data::statistic::{CustomStatistic, StatisticCategory};
+
+    #[test]
+    fn accepts_modern_statistic_criteria() {
+        assert!(is_valid_criterion("minecraft.custom:minecraft.sneak_time"));
+        assert!(is_valid_criterion("minecraft.custom:minecraft.boat_one_cm"));
+        assert!(is_valid_criterion(
+            "minecraft.custom:minecraft.interact_with_anvil"
+        ));
+        assert!(!is_valid_criterion("stat.custom.sneakTime"));
+        assert!(!is_valid_criterion("minecraft.custom:"));
+    }
+
+    #[test]
+    fn maps_custom_statistics_to_vanilla_criteria() {
+        assert_eq!(
+            statistic_criterion(
+                StatisticCategory::Custom,
+                CustomStatistic::InteractWithAnvil as i32,
+            )
+            .as_deref(),
+            Some("minecraft.custom:minecraft.interact_with_anvil")
+        );
+    }
 }

@@ -438,6 +438,7 @@ fn map_team_settings(
                 crate::world::scoreboard::NameTagVisibility::HideForOwnTeam
             }
         },
+        death_message_visibility: crate::world::scoreboard::NameTagVisibility::Always,
         collision_rule: match settings.collision_rule {
             CollisionRule::Always => crate::world::scoreboard::CollisionRule::Always,
             CollisionRule::Never => crate::world::scoreboard::CollisionRule::Never,
